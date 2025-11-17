@@ -29,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
     let base_url: BaseUrl = server.parse().unwrap();
 
     // minio prefix pool
-    let (sub_dir_tx, sub_dir_rx) = mpsc::channel::<String>(20);
+    let (sub_dir_tx, sub_dir_rx) = mpsc::unbounded_channel::<String>();
     let sub_dir_rx = Arc::new(Mutex::new(sub_dir_rx));
     // delete pull
     let (tx, rx) = mpsc::channel::<String>(1000);
@@ -66,9 +66,9 @@ async fn main() -> anyhow::Result<()> {
                                         Ok(resp) => {
                                             for item in resp.contents {
                                                 // ส่งชื่อไฟล์เข้า queue
-                                                println!("\r[queue] <- {}",&item.name);
+                                                println!("\r📥 <- {}",&item.name);
                                                 println!("");
-                                                if sub_dir_tx.send(item.name.clone()).await.is_err() {
+                                                if sub_dir_tx.send(item.name.clone()).is_err() {
                                                     return; // consumer ตาย → หยุด
                                                 }
                                             }
@@ -89,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
     // --------------
     // Task A: LIST (Producer)
     // --------------
-    let workers_list_obj: i32 = 5; // get พร้อมกัน x ตัว
+    let workers_list_obj: i32 = 16; // get พร้อมกัน x ตัว
     let mut workers_list_obj_handles = Vec::new();
     for _ in 0..workers_list_obj {
         let minio_clone = Arc::clone(&shared_minio); 
@@ -119,6 +119,10 @@ async fn main() -> anyhow::Result<()> {
                         Ok(resp) => {
                             for item in resp.contents {
                                 // ส่งชื่อไฟล์เข้า queue
+                                
+                                println!("\r🗂️ -> {}",&item.name);
+                              
+                                //println!("");
                                 if tx.send(item.name.clone()).await.is_err() {
                                     return; // consumer ตาย → หยุด
                                 }
@@ -137,7 +141,7 @@ async fn main() -> anyhow::Result<()> {
     // --------------
     // Task B: DELETE worker pool (Consumers)
     // --------------
-    let workers: i32 = 10; // ลบพร้อมกัน x ตัว
+    let workers: i32 = 8; // ลบพร้อมกัน x ตัว
     let mut worker_handles = Vec::new();
     let global_counter = Arc::new(AtomicU64::new(0));
     for w in 0..workers {
@@ -162,7 +166,7 @@ async fn main() -> anyhow::Result<()> {
                 match result {
                     Ok(_) => {
                         let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                        print!("\r{}-{} `del` {}",&n,&w,&key);
+                        println!("\r{}-{} `del` {}",&n,&w,&key);
                         
                     }
                     Err(e) => eprintln!("[{}] delete {} error: {:?}", &w,&key, e),
