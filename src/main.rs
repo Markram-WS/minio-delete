@@ -8,6 +8,11 @@ use std::env;
 use dotenv::dotenv;
 use tokio_stream::StreamExt;
 use minio::s3::http::BaseUrl;
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tokio::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -69,53 +74,90 @@ async fn main() -> anyhow::Result<()> {
     }
     
     //let first5: Vec<String> = sub_dir_prefix.iter().take(10).cloned().collect();
-    let concurrency = 10;
     for sub_dir in sub_dir_prefix {
         println!("");
         println!("-> {}",&sub_dir);
-        // สร้าง stream ของ object จาก sub_dir
-        let stream_sub_dir = ListObjects::new(minio.clone(), bucket_name.to_string())
-            .prefix(Some(sub_dir.to_string()))
-            .recursive(true)
-            .max_keys(Some(10000))
-            .to_stream().await;
-    
-        // iterate ผ่าน stream ทีละ response
-        let mut stream_sub_dir = Box::pin(stream_sub_dir);
-        let mut nitems = 1;
-        while let Some(result) = stream_sub_dir.next().await {
-            match result {
-                Ok(resp) => {
-                    for item in resp.contents {
-                        let obj = ObjectToDelete::from(&item.name);
-                        let delete_result= minio.delete_object(bucket_name.clone(),obj).send().await;
-                        match delete_result {
-                            Ok(_) => print!("\rDel {} {}", nitems, item.name),
-                            Err(e) => eprintln!("Error deleting object: {:?}", e),
+
+        let (tx, rx) = mpsc::channel::<String>(1000);
+        let rx = Arc::new(Mutex::new(rx));
+        // --------------
+        // Task A: LIST (Producer)
+        // --------------
+        let minio_list = minio.clone();
+        let bucket = bucket_name.clone();
+        let sub_dir = sub_dir.to_string();
+
+        let list_task = tokio::spawn(async move {
+            let stream = ListObjects::new(minio_list.clone(), bucket.to_string())
+                .prefix(Some(sub_dir))
+                .recursive(true)
+                .max_keys(Some(10000))
+                .to_stream()
+                .await;
+        
+            let mut stream = Box::pin(stream);
+        
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(resp) => {
+                        for item in resp.contents {
+                            // ส่งชื่อไฟล์เข้า queue
+                            if tx.send(item.name.clone()).await.is_err() {
+                                return; // consumer ตาย → หยุด
+                            }
                         }
-                        nitems += 1;
                     }
-                    print!("")
+                    Err(e) => eprintln!("list error: {:?}", e),
                 }
-                Err(e) => eprintln!("Error listing objects: {:?}", e),
             }
+            // drop tx เพื่อปิด channel → workers จะรู้ว่าหมดงานแล้ว
+        });
+
+        // --------------
+        // Task B: DELETE worker pool (Consumers)
+        // --------------
+        let workers = 8; // ลบพร้อมกัน x ตัว
+        let mut worker_handles = Vec::new();
+        let global_counter = Arc::new(AtomicU64::new(0));
+        
+        for w in 0..workers {
+            let rx = Arc::clone(&rx);
+            let minio_del = minio.clone();
+            let counter = global_counter.clone();
+            let handle = tokio::spawn(async move {
+                loop {
+                    // ---- lock -> recv -> unlock ----
+                    let key_opt: Option<String> = {
+                        let mut guard = rx.lock().await;
+                        guard.recv().await
+                    };
+        
+                    // channel closed -> exit worker
+                    let Some(key) = key_opt else { break };
+        
+                    let obj: ObjectToDelete = ObjectToDelete::from(&key);
+                    let result =minio_del.delete_object(bucket.to_string(), obj).send().await;
+                    match result {
+                        Ok(_) => {
+                            let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                            print!("\r{}-{} `del` {}",&n,&w,&key);
+                            
+                        }
+                        Err(e) => eprintln!("[{}] delete {} error: {:?}", &w,&key, e),
+                    }
+                }
+            });
+            worker_handles.push(handle);
+        }
+        // --------------
+        // Wait
+        // --------------
+        list_task.await?;
+        for h in worker_handles {
+            let _ = h.await;
         }
     }
-    
-    // while let Some(item) = stream.next().await {
-    //     match item {
-    //         Ok(obj) => {
-    //             println!("Object Key: {}", obj.key);
-    //         }
-    //         Err(e) => eprintln!("Error: {:?}", e),
-    //     }
-    // }
 
-    // ---- สำคัญที่สุด ----
-    // กำหนดว่าให้ลบพร้อมกันสูงสุดกี่อัน
-    // stream.map(...) = แปลง object → future ของการ delete
-    // buffer_unordered(concurrency) = run พร้อมกันได้สูงสุด 10 อัน
-    
 
     Ok(())
 }
