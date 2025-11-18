@@ -38,6 +38,8 @@ async fn main() -> anyhow::Result<()> {
     let minio = Client::new(base_url.clone(), Some(Box::new(static_provider.clone())), None,None)?;
     let shared_minio : Arc<Client> = Arc::new(minio);
     let shared_minio_spawn = Arc::clone(&shared_minio);
+
+    let global_outstanding: Arc<_> = Arc::new(AtomicU64::new(0));
     let list_prefix = tokio::spawn(async move {
         for prefix in path_prefix {
             let minio_clone = Arc::clone(&shared_minio_spawn); 
@@ -89,9 +91,10 @@ async fn main() -> anyhow::Result<()> {
     // --------------
     // Task A: LIST (Producer)
     // --------------
-    let workers_list_obj: i32 = 16; // get พร้อมกัน x ตัว
+    let workers_list_obj: i32 = 8; // get พร้อมกัน x ตัว
     let mut workers_list_obj_handles = Vec::new();
     for _ in 0..workers_list_obj {
+        let outstanding = global_outstanding.clone();
         let minio_clone = Arc::clone(&shared_minio); 
         let tx = tx.clone();
         let w_sub_dir_rx = Arc::clone(&sub_dir_rx);
@@ -105,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
     
                 let Some(sub_dir) = sub_dir else { break };
                 let minio_client = (*minio_clone).clone(); 
+                println!("⌛ {}",&sub_dir);
                 let stream = ListObjects::new(minio_client, (&bucket_name).to_string())
                     .prefix(Some(sub_dir))
                     .recursive(true)
@@ -119,9 +123,9 @@ async fn main() -> anyhow::Result<()> {
                         Ok(resp) => {
                             for item in resp.contents {
                                 // ส่งชื่อไฟล์เข้า queue
+                                let n=outstanding.fetch_add(1, Ordering::SeqCst)+1; 
+                                println!("\r🗂️  {}  <- {}",n,&item.name);
                                 
-                                println!("\r🗂️ -> {}",&item.name);
-                              
                                 //println!("");
                                 if tx.send(item.name.clone()).await.is_err() {
                                     return; // consumer ตาย → หยุด
@@ -141,10 +145,12 @@ async fn main() -> anyhow::Result<()> {
     // --------------
     // Task B: DELETE worker pool (Consumers)
     // --------------
-    let workers: i32 = 8; // ลบพร้อมกัน x ตัว
+    let workers: i32 = 4; // ลบพร้อมกัน x ตัว
     let mut worker_handles = Vec::new();
     let global_counter = Arc::new(AtomicU64::new(0));
+    
     for w in 0..workers {
+        let outstanding = global_outstanding.clone();
         let minio_clone = Arc::clone(&shared_minio); 
         let rx = Arc::clone(&rx);
         let counter = global_counter.clone();
@@ -162,12 +168,12 @@ async fn main() -> anyhow::Result<()> {
     
                 let obj: ObjectToDelete = ObjectToDelete::from(&key);
                 let client: &minio::s3::Client = &*minio_clone; 
-                let result = client.delete_object(bucket_name.clone(), obj).send().await;
+                let result = client.delete_object(bucket_name, obj).send().await;
                 match result {
                     Ok(_) => {
-                        let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                        println!("\r{}-{} `del` {}",&n,&w,&key);
-                        
+                        let n: u64 = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                        let n_del = outstanding.fetch_sub(1, Ordering::SeqCst)-1;
+                        println!("\r{}-{} -> 🗑️{} - {}",&n_del,&w,&n,&key);
                     }
                     Err(e) => eprintln!("[{}] delete {} error: {:?}", &w,&key, e),
                 }
