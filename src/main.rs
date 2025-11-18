@@ -17,10 +17,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv().ok();
-
+    
     let bucket_name = "reportingdb";
-    let path_prefix: Vec<&str> = vec!["sales_external.prod/"];
-
+    let minio_path = env::var("MINIO_PATH")?;
+    let path_prefix: Vec<String> = vec![minio_path];
     let server = env::var("MINIO_SERVER")?;
     let user = env::var("MINIO_USER")?;
     let password = env::var("MINIO_PASS")?;
@@ -31,8 +31,8 @@ async fn main() -> anyhow::Result<()> {
     // minio prefix pool
     let (sub_dir_tx, sub_dir_rx) = mpsc::unbounded_channel::<String>();
     let sub_dir_rx = Arc::new(Mutex::new(sub_dir_rx));
-    // delete pull
-    let (tx, rx) = mpsc::channel::<String>(1000);
+    // delete pool
+    let (tx, rx) = mpsc::channel::<String>(10000);
     let rx = Arc::new(Mutex::new(rx));
 
     let minio = Client::new(base_url.clone(), Some(Box::new(static_provider.clone())), None,None)?;
@@ -69,7 +69,6 @@ async fn main() -> anyhow::Result<()> {
                                             for item in resp.contents {
                                                 // ส่งชื่อไฟล์เข้า queue
                                                 println!("\r📥 <- {}",&item.name);
-                                                println!("");
                                                 if sub_dir_tx.send(item.name.clone()).is_err() {
                                                     return; // consumer ตาย → หยุด
                                                 }
@@ -91,9 +90,10 @@ async fn main() -> anyhow::Result<()> {
     // --------------
     // Task A: LIST (Producer)
     // --------------
-    let workers_list_obj: i32 = 8; // get พร้อมกัน x ตัว
+
+    let workers_list_obj:i32  = env::var("WORKERS_LIST").unwrap().parse()?; // get พร้อมกัน x ตัว
     let mut workers_list_obj_handles = Vec::new();
-    for _ in 0..workers_list_obj {
+    for w in 0..workers_list_obj {
         let outstanding = global_outstanding.clone();
         let minio_clone = Arc::clone(&shared_minio); 
         let tx = tx.clone();
@@ -108,7 +108,7 @@ async fn main() -> anyhow::Result<()> {
     
                 let Some(sub_dir) = sub_dir else { break };
                 let minio_client = (*minio_clone).clone(); 
-                println!("⌛ {}",&sub_dir);
+                println!("[{}]⌛ {}",&w,&sub_dir);
                 let stream = ListObjects::new(minio_client, (&bucket_name).to_string())
                     .prefix(Some(sub_dir))
                     .recursive(true)
@@ -124,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
                             for item in resp.contents {
                                 // ส่งชื่อไฟล์เข้า queue
                                 let n=outstanding.fetch_add(1, Ordering::SeqCst)+1; 
-                                println!("\r🗂️  {}  <- {}",n,&item.name);
+                                println!("[{}]🗂️  {}  <- {}",w,n,&item.name);
                                 
                                 //println!("");
                                 if tx.send(item.name.clone()).await.is_err() {
@@ -145,7 +145,7 @@ async fn main() -> anyhow::Result<()> {
     // --------------
     // Task B: DELETE worker pool (Consumers)
     // --------------
-    let workers: i32 = 4; // ลบพร้อมกัน x ตัว
+    let workers: i32 = env::var("WORKERS_DEL").unwrap().parse()?; // ลบพร้อมกัน x ตัว
     let mut worker_handles = Vec::new();
     let global_counter = Arc::new(AtomicU64::new(0));
     
@@ -173,7 +173,7 @@ async fn main() -> anyhow::Result<()> {
                     Ok(_) => {
                         let n: u64 = counter.fetch_add(1, Ordering::Relaxed) + 1;
                         let n_del = outstanding.fetch_sub(1, Ordering::SeqCst)-1;
-                        println!("\r{}-{} -> 🗑️{} - {}",&n_del,&w,&n,&key);
+                        println!("[{}]-{} -> 🗑️  {} - {}",&w,&n_del,&n,&key);
                     }
                     Err(e) => eprintln!("[{}] delete {} error: {:?}", &w,&key, e),
                 }
